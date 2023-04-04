@@ -1,0 +1,444 @@
+// #Matolay
+#include <SPI.h>
+#include <SD.h>
+#include <RTClib.h>
+#include <Wire.h>
+#include "dht11.h"
+
+#define DHT11PIN 8
+dht11 DHT11;
+
+RTC_DS1307 RTC;
+#define FILE_CONFIG "config.txt"
+#define FILE_DATA "data.txt"
+#define KEY_MAX_LENGTH 30
+#define VALUE_MAX_LENGTH 30
+
+int lampOn;
+bool lampOnBoo = false;
+int waterTo;
+int wateringHour = 5;
+bool wateredToday = false;
+bool watering = false;
+
+bool scanning = false;
+bool scannedPrevious = false;
+int scanningHour = 2;
+
+// relay pin
+int in1 = 4; // relay 1
+int in2 = 5; // relay 2
+
+// flow sensor
+int flowSensorPin = 2; // THis should be interrupt pin.
+volatile long pulse;
+float volume = 0.0;
+
+// Soil/Temp Moisture sensor
+int foilSensor = A1;
+int temp = A0;
+
+// message tokens
+// const char START_TOKEN = '?';
+// const char END_TOKEN = ';';
+// const char DELIMIT_TOKEN = '&';
+const int CHAR_TIMEOUT = 20;
+String getNExtNumber(String text, int cursor);
+bool waitingForStarToken = true;
+String messageBuffer = "";
+long lastRun = millis();
+bool outputValue = false;
+
+void setup()
+{
+
+    Serial.begin(9600);
+    RTC.begin();
+
+    // -- Start Time
+    // To refreshing time  remove "!", compile, upload to refresh the time in the RTC module
+    // the time will be set to the time of the compilation
+    if (!RTC.isrunning())
+    {
+        Serial.println("RTC is NOT running!");
+        // following line sets the RTC to the date & time this sketch was compiled
+        RTC.adjust(DateTime(__DATE__, __TIME__));
+    }
+
+    //-- read config file and sd card check
+    if (!SD.begin(53))
+    {
+        Serial.println(F("SD Card failed, or not present"));
+        while (1)
+            ;
+    }
+    checkConfig();
+
+    //-- relay setup
+    pinMode(in2, OUTPUT);
+    digitalWrite(in2, LOW);
+    pinMode(in1, OUTPUT);
+    digitalWrite(in1, LOW);
+
+    //-- flow  sensor setup
+    pinMode(flowSensorPin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(flowSensorPin), increase, RISING);
+    pinMode(DHT11PIN, OUTPUT);
+}
+
+void loop()
+{
+    delay(2000);
+    checkBT();
+    delay(2000);
+    checktime();
+    make();
+}
+//-------------------------------------------------------------------------------------
+void checkConfig()
+{
+    // Serial.println(F("SD Card initialized."));
+    // lampOn=15&waterTo=300
+    lampOn = SD_findInt(F("lampOn"));
+    waterTo = SD_findInt(F("waterTo"));
+    Serial.println(lampOn);
+    Serial.println(waterTo);
+}
+//-------------------------------------------------------------------------------------
+int SD_findInt(const __FlashStringHelper *key)
+{
+    char value_string[VALUE_MAX_LENGTH];
+    int value_length = SD_findKey(key, value_string);
+    return HELPER_ascii2Int(value_string, value_length);
+}
+//-------------------------------------------------------------------------------------
+int SD_findKey(const __FlashStringHelper *key, char *value)
+{
+    File configFile = SD.open(FILE_CONFIG);
+
+    if (!configFile)
+    {
+        Serial.print(F("SD Card: error on opening file "));
+        Serial.println(FILE_CONFIG);
+        return;
+    }
+
+    char key_string[KEY_MAX_LENGTH];
+    char SD_buffer[KEY_MAX_LENGTH + VALUE_MAX_LENGTH + 1]; // 1 is = character
+    int key_length = 0;
+    int value_length = 0;
+
+    // Flash string to string
+    PGM_P keyPoiter;
+    keyPoiter = reinterpret_cast<PGM_P>(key);
+    byte ch;
+    do
+    {
+        ch = pgm_read_byte(keyPoiter++);
+        if (ch != 0)
+            key_string[key_length++] = ch;
+    } while (ch != 0);
+
+    // check line by line
+    while (configFile.available())
+    {
+        int buffer_length = configFile.readBytesUntil('\n', SD_buffer, 100);
+        if (SD_buffer[buffer_length - 1] == '\r')
+            buffer_length--; // trim the \r
+
+        if (buffer_length > (key_length + 1))
+        { // 1 is = character
+            if (memcmp(SD_buffer, key_string, key_length) == 0)
+            { // equal
+                if (SD_buffer[key_length] == '=')
+                {
+                    value_length = buffer_length - key_length - 1;
+                    memcpy(value, SD_buffer + key_length + 1, value_length);
+                    break;
+                }
+            }
+        }
+    }
+
+    configFile.close(); // close the file
+    return value_length;
+}
+//-------------------------------------------------------------------------------------
+int HELPER_ascii2Int(char *ascii, int length)
+{
+    int sign = 1;
+    int number = 0;
+
+    for (int i = 0; i < length; i++)
+    {
+        char c = *(ascii + i);
+        if (i == 0 && c == '-')
+            sign = -1;
+        else
+        {
+            if (c >= '0' && c <= '9')
+                number = number * 10 + (c - '0');
+        }
+    }
+
+    return number * sign;
+}
+//-------------------------------------------------------------------------------------
+void checktime()
+{
+   //RTC.adjust(DateTime(__DATE__, __TIME__));
+    DateTime now = RTC.now();
+
+    // check watering time
+    // reset watering to every day watering
+    if (now.hour() > 5 && lampOn + 5 > now.hour())
+    {
+        lampOnBoo = true;
+    }
+
+    if (now.hour() < 5 || lampOn + 5 < now.hour())
+    {
+        lampOnBoo = false;
+    }
+
+    if (now.hour() == (wateringHour + 1))
+    {
+
+        wateredToday = false;
+        scannedPrevious = false;
+    }
+
+    // If it is time to water, and we haven't watered, we enable watering
+    if (now.hour() == wateringHour && wateredToday == false)
+    {
+        //Serial.println("Not watered");
+        watering = true;
+        wateredToday = true;
+        volume = 0.0;
+        pulse = 0;
+    }
+    if (now.hour() % scanningHour == 0 && scannedPrevious == false)
+    {
+        //Serial.println("Not Scanned");
+        scanning = true;
+        scannedPrevious = true;
+    }
+    if (now.hour() % scanningHour != 0)
+    {
+        scannedPrevious = false;
+    }
+}
+//-------------------------------------------------------------------------------------
+void checkBT()
+{
+    // handle Bluethooth link
+    char nextData;
+
+    if (Serial.available() > 0)
+    {
+
+        // check for start of message
+        if (waitingForStarToken)
+        {
+            do
+            {
+                nextData = Serial.read();
+                if (nextData == '#')
+                {
+                    sendData();
+                }
+                if (nextData == 's')
+                {
+                    scanning = true;
+                    scan();
+                }
+            } while ((nextData != '?') && Serial.available());
+
+            if (nextData == '?')
+            {
+                // Serial.println("message start");
+                waitingForStarToken = false;
+            }
+        }
+        // read the message
+        if (!waitingForStarToken && Serial.available())
+        {
+            do
+            {
+                nextData = Serial.read();
+                // Serial.println(nextData);
+                messageBuffer += nextData;
+            } while ((nextData != ';') && Serial.available());
+            if (nextData == ';')
+            {
+                // remove last character
+                messageBuffer = messageBuffer.substring(0, messageBuffer.length() - 1);
+                // Serial.println("message complete - " + messageBuffer);
+                saveConfig(messageBuffer);
+
+                messageBuffer = "";
+                waitingForStarToken = true;
+            }
+            // check for char timeout
+            if (messageBuffer.length() > CHAR_TIMEOUT)
+            {
+                Serial.println("message data timeout  -" + messageBuffer);
+
+                messageBuffer = "";
+                waitingForStarToken = true;
+            }
+        }
+    }
+}
+//-------------------------------------------------------------------------------------
+void saveConfig(String st)
+{
+    SD.remove(FILE_CONFIG);
+
+    String databuffer = "";
+    String databuffer2 = "";
+    databuffer = st.substring(0, 9); // lampOn=15&waterTo=300
+    databuffer2 = st.substring(10, st.length());
+
+    File dataFile = SD.open(FILE_CONFIG, FILE_WRITE);
+    if (dataFile)
+    {
+        // Serial.print("Writing to data.txt...");
+        dataFile.print(databuffer);
+        dataFile.print("\n");
+        dataFile.print(databuffer2);
+        // close the file:
+        dataFile.close();
+        Serial.println("Config saved successfully.");
+    }
+    else
+    {
+        // if the file didn't open, print an error:
+        Serial.println("Error opening data.txt");
+    }
+    checkConfig();
+}
+//-------------------------------------------------------------------------------------
+void sendData()
+{
+
+    File dataFile = SD.open(FILE_DATA);
+    if (dataFile)
+    {
+        while (dataFile.available())
+        {
+            Serial.write(dataFile.read());
+        }
+        dataFile.close();
+    }
+    else
+    {
+        // if the file didn't open, print an error:
+        Serial.println("Error opening data.txt");
+    }
+
+    waitingForStarToken = true;
+}
+//-------------------------------------------------------------------------------------
+void make()
+{
+
+    if (scanning == true)
+    {
+        DateTime now = RTC.now();
+        float a = analogRead(foilSensor);
+        int tempi = analogRead(temp);
+        
+        int chk = DHT11.read(DHT11PIN);
+      
+
+        File dataFile = SD.open(FILE_DATA, FILE_WRITE);
+        if (dataFile)
+        {
+            // Serial.print("Writing to data.txt...");
+            delay(1000);
+            dataFile.print(now.year(), DEC);
+            dataFile.print(".");
+            dataFile.print(now.month(), DEC);
+            dataFile.print(".");
+            dataFile.print(now.day(), DEC);
+            dataFile.print(" ");
+            dataFile.print(now.hour(), DEC);
+            dataFile.print(":");
+            dataFile.print(now.minute(), DEC);
+            dataFile.print(" ");
+            dataFile.print("Temp: ");
+            dataFile.print(DHT11.temperature);
+            dataFile.print(", ");
+            dataFile.print("Hum: ");
+            dataFile.print(DHT11.humidity);
+            dataFile.print("\n");
+            // close the file:
+            dataFile.close();
+            //Serial.println("Data saved successfully.");
+
+            if (DHT11.temperature != 0) //if the temp is 0 . Hardware initialization issue, try again, for valid data.
+            {
+                scanning = false;
+            }
+            
+        }
+        else
+        {
+            // if the file didn't open, print an error:
+            Serial.println("Error opening data.txt");
+        }
+    }
+
+    if (lampOnBoo == true)
+    {
+        digitalWrite(in1, HIGH);
+    }
+
+    if (lampOnBoo == false)
+    {
+        digitalWrite(in1, LOW);
+    }
+
+    if (watering == true)
+    {
+        // Serial.println("watering time");
+        if (volume < waterTo)
+        {
+            digitalWrite(in2, HIGH);
+            volume = 2.663 * pulse;
+            Serial.print(volume);
+            Serial.println(" mL");
+            delay(100);
+        }
+    }
+    if (volume > waterTo)
+    {
+        digitalWrite(in2, LOW);
+        watering = false;
+        volume = 0.0;
+        pulse = 0;
+        // Serial.println(" watered");
+        Serial.println(volume);
+    }
+}
+//-------------------------------------------------------------------------------------
+void increase()
+{
+    pulse++;
+}
+//-------------------------------------------------------------------------------------
+void scan()
+{
+    int chk = DHT11.read(DHT11PIN);
+    Serial.print("Temp: ");
+    Serial.println(DHT11.temperature);
+    Serial.print("Hum: ");
+    Serial.println(DHT11.humidity);
+    delay(1000);
+}
+//-------------------------------------------------------------------------------------
+void lamp()
+
+{
+}
